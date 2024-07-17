@@ -29,7 +29,7 @@ class FCNNModel(nn.Module):
         x = torch.relu(self.fc2(x))
         x = self.fc3(x)
         return x
-    
+
     def _initialize_weights(self):
         init.kaiming_normal_(self.fc1.weight, mode='fan_in', nonlinearity='relu')
         init.kaiming_normal_(self.fc2.weight, mode='fan_in', nonlinearity='relu')
@@ -40,7 +40,6 @@ class FCNNModel(nn.Module):
             init.constant_(self.fc2.bias, 0)
         if self.fc3.bias is not None:
             init.constant_(self.fc3.bias, 0)
-
 
 def evaluate_model(model, test_loader):
     model.eval()
@@ -62,7 +61,6 @@ transform = transforms.Compose([
 train_dataset = datasets.MNIST('../data', train=True, download=True, transform=transform)
 test_dataset = datasets.MNIST('../data', train=False, transform=transform)
 
-
 def average_weights(w):
     w_avg = copy.deepcopy(w[0])
     for key in w_avg.keys():
@@ -73,7 +71,7 @@ def average_weights(w):
 
 def recv_data(client_socket, initial_timeout=500, subsequent_timeout=0.5):
     data = b""
-    timeout=initial_timeout
+    timeout = initial_timeout
     while True:
         ready = select.select([client_socket], [], [], timeout)
         if ready[0]:
@@ -82,7 +80,7 @@ def recv_data(client_socket, initial_timeout=500, subsequent_timeout=0.5):
                 if not packet:
                     break
                 data += packet
-                timeout=subsequent_timeout
+                timeout = subsequent_timeout
             except socket.timeout:
                 break
             except ConnectionResetError:
@@ -102,25 +100,21 @@ def federated_proximal_averaging(global_model, local_weights, epochs, mu=0.01):
 
     for key in global_model.state_dict().keys():
         weighted_sum = torch.zeros_like(global_model.state_dict()[key], dtype=torch.float32)
-        
+
         for i in range(len(local_weights)):
             weighted_sum += (local_weights[i][key].float() + mu * global_model.state_dict()[key].float()) * epochs[i]
-        
+
         new_state_dict[key] = weighted_sum / (total_epochs * (1 + mu))
-    
+
     global_model.load_state_dict(new_state_dict)
 
+def handle_client(client_socket, addr, client_info, client_sockets, lock, global_weights, total_epochs, phase_barrier, client_weights, client_epochs, round_num, response_times):
 
-def handle_client(client_socket, addr, client_info, client_sockets, lock, global_weights, total_epochs, phase_barrier, client_weights, client_epochs):
-
-    #tlwkr
-    # print(f"Request to Client {addr}")
-    send_data(client_socket,1)
+    # Request to Client
+    send_data(client_socket, 1)
 
     # 클라이언트로부터 GPU 정보 수신
-
     gpu_info = recv_data(client_socket)
-    # print(f"Client {addr} received GPU info")
 
     lock.acquire()
     try:
@@ -132,53 +126,62 @@ def handle_client(client_socket, addr, client_info, client_sockets, lock, global
     # 첫 번째 단계 완료 동기화
     phase_barrier.wait()
 
-    # GPU 정보에 따른 에포크 분배
+    # 에포크 분배
     lock.acquire()
     try:
-        total_gflops = sum(c[1]['gflops'] for c in client_info)
-        for c in client_info:
-            c.append(int(total_epochs * (c[1]['gflops'] / total_gflops)))
-            c.append(False)
-            c.append(False)
-        epoch_sum = sum(c[2] for c in client_info)
-        if epoch_sum < total_epochs:
-            max_client = max(client_info, key=lambda x: x[2])
-            max_client[2] += 1
+        if round_num == 0:
+            client_info[-1].append(1)  # 첫 번째 라운드에서는 1 에포크만 분배
+        else:
+            total_response_time = sum(response_times.values())
+            epochs_per_client = []
+            for c in client_info:
+                allocated_epochs = max(1, int(total_epochs * (response_times[c[0]] / total_response_time)))
+                epochs_per_client.append(allocated_epochs)
+
+            # 에포크 수가 부족한 경우 처리
+            epoch_sum = sum(epochs_per_client)
+            if epoch_sum < total_epochs:
+                remaining_epochs = total_epochs - epoch_sum
+                fastest_client = min(response_times, key=response_times.get)
+                fastest_client_idx = [c[0] for c in client_info].index(fastest_client)
+                epochs_per_client[fastest_client_idx] += remaining_epochs
+
+            # 클라이언트에 할당된 에포크 설정
+            client_info[-1].append(epochs_per_client[-1])
     finally:
         lock.release()
 
     # 두 번째 단계 완료 동기화
     phase_barrier.wait()
 
+    # 클라이언트에 에포크 수와 글로벌 가중치 전송
     for c in client_info:
         if c[0] == addr[0]:
             client = c
-            print(client[2])
 
-    # 클라이언트에 에포크 수와 글로벌 가중치 전송
     send_data(client_socket, (global_weights, client[2]))
-    # print(f'Sent global weights and epochs to {addr[0]}, {client[2]}')
 
     # 세 번째 단계 완료 동기화
     phase_barrier.wait()
 
     # 클라이언트로부터 계산된 가중치 수신
+    start_time = time.time()
     client_data = recv_data(client_socket)
+    response_time = time.time() - start_time
+
     if client_data:
         lock.acquire()
         try:
             client_weights.append(client_data)
             client_epochs.append(client[2])
-            client[4] = True
-            # print(f'Received calculated data from {addr[0]}')
+            response_times[addr[0]] = response_time
         finally:
             lock.release()
 
     phase_barrier.wait()
-    # client_socket.close()
     return client_weights
 
-def main_server(num_clients=2, total_epochs=10, rounds=3): # 조건 설정
+def main_server(num_clients=2, total_epochs=10, rounds=3):  # 조건 설정
     # 소켓 설정
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind(('192.168.0.23', 8888))
@@ -188,24 +191,52 @@ def main_server(num_clients=2, total_epochs=10, rounds=3): # 조건 설정
     global_model = FCNNModel()
     global_weights = global_model.state_dict()
     lock = threading.Lock()
-    socket_info=[]
+    socket_info = []
     for i in range(num_clients):
         client_socket, addr = server_socket.accept()
         socket_info.append([client_socket, addr])
         print(f'First connection from {addr[0]} has been established!')
-    real_start_time=time.time()
-    for rnd in range(rounds):
+
+    real_start_time = time.time()
+    response_times = {addr[0]: 1.0 for _, addr in socket_info}  # 초기 응답 시간 값을 1로 설정
+
+    # 0번째 라운드: 각 기기에 1 에포크씩 할당하여 응답 시간 측정
+    start_time = time.time()
+    client_info = []  # [addr[0], gpu_info, epoch]
+    client_sockets = {}  # {addr[0]: client_socket}
+    phase_barrier = threading.Barrier(num_clients)  # 동기화 바리어
+    client_weights = []  # 모든 클라이언트의 가중치를 저장하는 리스트
+    client_epochs = []
+
+    threads = []
+    print('Round 0 start')
+    for i in range(num_clients):
+        thread = threading.Thread(target=handle_client, args=(socket_info[i][0], socket_info[i][1], client_info, client_sockets, lock, global_weights, 1, phase_barrier, client_weights, client_epochs, 0, response_times))
+        thread.start()
+        threads.append(thread)
+
+    for thread in threads:
+        thread.join()
+
+    print(f'Round 0 completed in {time.time() - start_time} seconds.')
+
+    # 연평균 가중치 계산 및 글로벌 모델 업데이트
+    federated_proximal_averaging(global_model, client_weights, client_epochs)
+    global_weights = global_model.state_dict()
+
+    # 실제 라운드 시작
+    for rnd in range(1, rounds + 1):
         start_time = time.time()
-        client_info = []  # [addr[0], gpu_info, epoch, secondTF, thirdTF]
+        client_info = []  # [addr[0], gpu_info, epoch]
         client_sockets = {}  # {addr[0]: client_socket}
         phase_barrier = threading.Barrier(num_clients)  # 동기화 바리어
         client_weights = []  # 모든 클라이언트의 가중치를 저장하는 리스트
         client_epochs = []
 
         threads = []
-        print(f'Round {rnd + 1} start')
+        print(f'Round {rnd} start')
         for i in range(num_clients):
-            thread = threading.Thread(target=handle_client, args=(socket_info[i][0], socket_info[i][1], client_info, client_sockets, lock, global_weights, total_epochs, phase_barrier, client_weights, client_epochs))
+            thread = threading.Thread(target=handle_client, args=(socket_info[i][0], socket_info[i][1], client_info, client_sockets, lock, global_weights, total_epochs, phase_barrier, client_weights, client_epochs, rnd, response_times))
             thread.start()
             threads.append(thread)
 
@@ -216,7 +247,7 @@ def main_server(num_clients=2, total_epochs=10, rounds=3): # 조건 설정
         federated_proximal_averaging(global_model, client_weights, client_epochs)
         global_weights = global_model.state_dict()
 
-        # print(f'Round {rnd + 1} completed in {time.time() - start_time} seconds.')
+        print(f'Round {rnd} completed in {time.time() - start_time} seconds.')
 
     # 최종 글로벌 모델 저장
     torch.save(global_model.state_dict(), 'global_model.pth')
@@ -227,7 +258,6 @@ def main_server(num_clients=2, total_epochs=10, rounds=3): # 조건 설정
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     distributed_accuracy = evaluate_model(global_model, test_loader)
     print(f"Distributed Training Accuracy: {distributed_accuracy}")
-
 
 if __name__ == '__main__':
     main_server()
